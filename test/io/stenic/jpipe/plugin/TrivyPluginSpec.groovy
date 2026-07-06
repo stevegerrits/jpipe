@@ -16,23 +16,27 @@ class TrivyPluginSpec extends Specification {
         Map env = [BUILD_TAG: 'jenkins-job-42', JOB_BASE_NAME: 'myjob']
         String imageId = 'sha256:abc123'
         boolean inspectFails = false
-        boolean scanFails = false
+        // trivy exit code the scan reports: 0 = clean, 2 = vulnerabilities
+        // found, any other non-zero = operational error (e.g. cache DB lock).
+        int scanExitCode = 0
 
         def sh(def arg) {
             if (arg instanceof Map) {
-                shCommands << arg.script.toString()
-                if (arg.script.toString().contains('docker inspect')) {
+                String s = arg.script.toString()
+                shCommands << s
+                if (s.contains('docker inspect')) {
                     if (inspectFails) {
                         throw new RuntimeException('no such image')
                     }
                     return imageId + '\n'
                 }
+                if (s.contains('aquasecurity/trivy')) {
+                    // Scan runs with returnStatus:true — hand back the exit code.
+                    return scanExitCode
+                }
                 return ''
             }
             shCommands << arg.toString()
-            if (arg.toString().contains('aquasecurity/trivy') && scanFails) {
-                throw new RuntimeException('script returned exit code 1')
-            }
             return null
         }
         def dir(String d, Closure c) { c() }
@@ -127,7 +131,7 @@ class TrivyPluginSpec extends Specification {
             assert trivyRuns(script).size() == 1
             def markers = script.files.findAll { k, v -> k.startsWith('.trivy-scanned-') }
             assert markers.size() == 1
-            assert markers.values()[0] == '.trivy-report-app|ok'
+            assert markers.values()[0] == '.trivy-report-repo_app|ok'
             assert script.published.size() == 1
             assert script.published[0].reportName == 'Trivy - app'
     }
@@ -145,7 +149,7 @@ class TrivyPluginSpec extends Specification {
         then:
             assert trivyRuns(script).size() == 1
             assert script.printed.any { it.contains('identical image') }
-            assert script.shCommands.any { it.contains("cp -r '.trivy-report-app/.' '.trivy-report-app-mirror/'") }
+            assert script.shCommands.any { it.contains("cp -r '.trivy-report-repo_app/.' '.trivy-report-repo_app-mirror/'") }
             assert script.published.size() == 2
             assert script.published[1].reportName == 'Trivy - app-mirror'
     }
@@ -194,6 +198,23 @@ class TrivyPluginSpec extends Specification {
             assert trivyRuns(script).size() == 2
     }
 
+    def "[TrivyPlugin] distinct images sharing a basename get distinct report dirs"() {
+        given:
+            def script = new FakeScript()
+            def first = new TrivyPlugin([containerImage: 'repo/app', report: 'html'])
+            def other = new TrivyPlugin([containerImage: 'other/app', report: 'html'])
+
+        when:
+            first.doRunImageScan(newEvent(script))
+            script.imageId = 'sha256:def456'
+            other.doRunImageScan(newEvent(script))
+
+        then:
+            assert trivyRuns(script).size() == 2
+            assert trivyRuns(script)[0].contains('.trivy-report-repo_app:/report')
+            assert trivyRuns(script)[1].contains('.trivy-report-other_app:/report')
+    }
+
     def "[TrivyPlugin] skipDuplicates false always scans"() {
         given:
             def script = new FakeScript()
@@ -227,7 +248,7 @@ class TrivyPluginSpec extends Specification {
     def "[TrivyPlugin] allowFailure swallows a failing scan, publishes, and records the failed verdict"() {
         given:
             def script = new FakeScript()
-            script.scanFails = true
+            script.scanExitCode = 2  // vulnerabilities found
             def plugin = new TrivyPlugin([containerImage: 'repo/app', report: 'html', allowFailure: true])
 
         when:
@@ -238,13 +259,13 @@ class TrivyPluginSpec extends Specification {
             assert script.catchErrors.size() == 1
             assert script.published.size() == 1
             def markers = script.files.findAll { k, v -> k.startsWith('.trivy-scanned-') }
-            assert markers.values()[0] == '.trivy-report-app|failed'
+            assert markers.values()[0] == '.trivy-report-repo_app|failed'
     }
 
     def "[TrivyPlugin] a failing scan without allowFailure propagates"() {
         given:
             def script = new FakeScript()
-            script.scanFails = true
+            script.scanExitCode = 2  // vulnerabilities found
             def plugin = new TrivyPlugin([containerImage: 'repo/app'])
 
         when:
@@ -257,7 +278,7 @@ class TrivyPluginSpec extends Specification {
     def "[TrivyPlugin] a skipped duplicate of a failed scan re-signals the failure"() {
         given:
             def script = new FakeScript()
-            script.scanFails = true
+            script.scanExitCode = 2  // vulnerabilities found
             def first = new TrivyPlugin([containerImage: 'repo/app', report: 'html', allowFailure: true])
             def mirror = new TrivyPlugin([containerImage: 'repo/app-mirror', report: 'html', allowFailure: true])
 
@@ -275,7 +296,7 @@ class TrivyPluginSpec extends Specification {
     def "[TrivyPlugin] a strict duplicate of a failed scan fails hard without allowFailure"() {
         given:
             def script = new FakeScript()
-            script.scanFails = true
+            script.scanExitCode = 2  // vulnerabilities found
             def first = new TrivyPlugin([containerImage: 'repo/app', report: 'html', allowFailure: true])
             def strictGate = new TrivyPlugin([containerImage: 'repo/app-mirror', report: 'html', allowFailure: false])
 
@@ -286,5 +307,36 @@ class TrivyPluginSpec extends Specification {
         then:
             thrown(Exception)
             assert trivyRuns(script).size() == 1
+    }
+
+    def "[TrivyPlugin] vulnerabilities use a distinct exit code so operational errors can be told apart"() {
+        given:
+            def script = new FakeScript()
+            def plugin = new TrivyPlugin([containerImage: 'repo/app'])
+
+        when:
+            plugin.doRunImageScan(newEvent(script))
+
+        then:
+            assert trivyRuns(script)[0].contains('--exit-code=2')
+    }
+
+    def "[TrivyPlugin] an operational scan error fails the build even with allowFailure"() {
+        given:
+            def script = new FakeScript()
+            script.scanExitCode = 1  // operational error (e.g. cache DB lock), not a vuln finding
+            def plugin = new TrivyPlugin([containerImage: 'repo/app', report: 'html', allowFailure: true])
+
+        when:
+            plugin.doRunImageScan(newEvent(script))
+
+        then:
+            // allowFailure only tolerates vulnerability findings, never a broken
+            // scan: the error propagates and is not swallowed as UNSTABLE.
+            thrown(RuntimeException)
+            assert script.catchErrors.isEmpty()
+            // No marker is written, so a retry re-scans instead of reusing a
+            // transient failure verdict.
+            assert !script.files.keySet().any { it.startsWith('.trivy-scanned-') }
     }
 }

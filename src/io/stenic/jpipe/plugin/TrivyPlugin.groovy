@@ -30,8 +30,12 @@ class TrivyPlugin extends Plugin {
         // "jpipe-trivy-cache-<job>"): trivy's cache DB takes an exclusive file
         // lock, so one cluster-wide volume would let concurrent builds of
         // unrelated jobs contend ("database is locked"). Scans within one build
-        // run sequentially and are safe. Set to '' to disable the mount, or to
-        // a fixed name to deliberately share a volume.
+        // run sequentially and are safe. Note the per-job volume does NOT
+        // isolate two concurrent builds of the SAME job (identical
+        // JOB_BASE_NAME) — those can still contend; such contention now surfaces
+        // as a build failure (operational error, see doRunImageScan) rather than
+        // a silent UNSTABLE. Set to '' to disable the mount, or to a fixed name
+        // to deliberately share a volume.
         this.cacheVolume = opts.get('cacheVolume', null);
         // Pipelines that publish the same built image under several names would
         // scan identical bits once per name. When enabled, images whose docker
@@ -56,7 +60,10 @@ class TrivyPlugin extends Plugin {
 
         String image = "${this.containerImage}:${event.version}"
         String imgName = this.containerImage.split('/').last()
-        String reportDir = ".trivy-report-${imgName}"
+        // Keyed on the full image path, not the basename: distinct images that
+        // share a basename (repo/app vs other/app) must not overwrite each
+        // other's report directory.
+        String reportDir = ".trivy-report-${this.containerImage.replaceAll(/[^A-Za-z0-9._-]/, '_')}"
 
         event.script.dir(event.script.pwd(tmp: true)) {
             String marker = this.duplicateMarker(event, image)
@@ -80,12 +87,24 @@ class TrivyPlugin extends Plugin {
                 }
             } else {
                 Boolean scanFailed = false
-                try {
-                    this.execScan(event, image, reportDir)
-                } catch (Exception e) {
+                int status = this.execScan(event, image, reportDir)
+                if (status == 2) {
+                    // Vulnerabilities found (trivy's dedicated --exit-code) —
+                    // subject to the allowFailure gate.
                     scanFailed = true
-                    this.handleScanFailure(event, e)
+                    this.handleScanFailure(event, new RuntimeException("Trivy found vulnerabilities in ${image}"))
+                } else if (status != 0) {
+                    // Any other non-zero code is an operational error (cache DB
+                    // lock, image pull failure, ...), not a vulnerability verdict.
+                    // Fail the build outright: allowFailure only tolerates
+                    // findings, and masking a transient error as a benign
+                    // UNSTABLE would make it indistinguishable from a clean scan.
+                    // No marker is written, so a retry re-scans from scratch.
+                    throw new RuntimeException("Trivy scan of ${image} failed with a non-vulnerability error (exit code ${status})")
                 }
+                // Written only when execution continues past the verdict: on a
+                // findings failure without allowFailure the build aborts above,
+                // so duplicates never get to consult a marker anyway.
                 if (marker != '') {
                     event.script.writeFile(file: marker, text: "${reportDir}|${scanFailed ? 'failed' : 'ok'}")
                 }
@@ -95,10 +114,17 @@ class TrivyPlugin extends Plugin {
         }
     }
 
-    private void execScan(Event event, String image, String reportDir) {
+    // Returns the trivy exit code: 0 = clean, 2 = vulnerabilities found,
+    // any other non-zero = operational error (see doRunImageScan). Uses
+    // returnStatus so an operational error is not swallowed by the shell step
+    // before we can tell it apart from a findings verdict.
+    private int execScan(Event event, String image, String reportDir) {
         List args = [
             '--no-progress',
-            '--exit-code=1',
+            // Vulnerabilities exit 2 so a findings verdict can be told apart
+            // from trivy's operational errors (exit 1: cache DB lock, image
+            // pull failure, ...).
+            '--exit-code=2',
             "--severity ${this.severity.join(',')}",
         ]
         if (this.report == 'html') {
@@ -114,19 +140,20 @@ class TrivyPlugin extends Plugin {
         String volume = this.resolveCacheVolume(event)
         String cacheMount = volume != '' ? "-v ${volume}:/root/.cache/trivy" : ''
 
-        event.script.sh """
+        return event.script.sh(returnStatus: true, script: """
             docker run \
                 -v /var/run/docker.sock:/var/run/docker.sock \
                 -v \$(pwd)/${reportDir}:/report \
                 ${cacheMount} \
                 ghcr.io/aquasecurity/trivy:${this.trivyVersion} \
                 image ${args.join(' ')} ${image}
-        """
+        """)
     }
 
-    // Note: a non-zero exit can mean "vulnerabilities found" but also any other
-    // scan error (e.g. cache contention); trivy's exit code does not
-    // distinguish them, so neither can allowFailure.
+    // Only reached for a vulnerability-findings verdict (trivy exit 2):
+    // allowFailure keeps the build green with an UNSTABLE stage. Operational
+    // errors (exit 1) never reach here — doRunImageScan fails the build on them
+    // so a transient error can't masquerade as a clean/permissive pass.
     private void handleScanFailure(Event event, Exception e) {
         if (this.allowFailure) {
             event.script.catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -168,7 +195,12 @@ class TrivyPlugin extends Plugin {
         event.script.sh "find . -maxdepth 1 -name '.trivy-scanned-*' -mtime +1 -delete || true"
         String buildTag = event.script.env.BUILD_TAG ?: 'build'
         String config = "${this.severity.join(',')}|${this.ignoreUnfixed}|${this.extraFlags}|${this.report}|${this.trivyVersion}"
-        String marker = ".trivy-scanned-${buildTag}-${event.version}-${imageId}-${config.hashCode()}"
+        // A real digest, not String.hashCode(): a 32-bit hash collision between
+        // two different configs would silently skip a stricter second scan —
+        // the exact failure mode the config-in-key design exists to prevent.
+        String configDigest = java.security.MessageDigest.getInstance('SHA-256')
+            .digest(config.getBytes('UTF-8')).encodeHex().toString().take(16)
+        String marker = ".trivy-scanned-${buildTag}-${event.version}-${imageId}-${configDigest}"
         return marker.replaceAll(/[^A-Za-z0-9._-]/, '_')
     }
 
