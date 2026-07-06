@@ -32,10 +32,10 @@ class TrivyPlugin extends Plugin {
         // unrelated jobs contend ("database is locked"). Scans within one build
         // run sequentially and are safe. Note the per-job volume does NOT
         // isolate two concurrent builds of the SAME job (identical
-        // JOB_BASE_NAME) — those can still contend; such contention now surfaces
-        // as a build failure (operational error, see doRunImageScan) rather than
-        // a silent UNSTABLE. Set to '' to disable the mount, or to a fixed name
-        // to deliberately share a volume.
+        // JOB_BASE_NAME) — those can still contend; such contention surfaces as
+        // an UNSTABLE stage (operational error, see doRunImageScan), never a
+        // blocked build. Set to '' to disable the mount, or to a fixed name to
+        // deliberately share a volume.
         this.cacheVolume = opts.get('cacheVolume', null);
         // Pipelines that publish the same built image under several names would
         // scan identical bits once per name. When enabled, images whose docker
@@ -87,6 +87,7 @@ class TrivyPlugin extends Plugin {
                 }
             } else {
                 Boolean scanFailed = false
+                Boolean operationalError = false
                 int status = this.execScan(event, image, reportDir)
                 if (status == 2) {
                     // Vulnerabilities found (trivy's dedicated --exit-code) —
@@ -95,17 +96,23 @@ class TrivyPlugin extends Plugin {
                     this.handleScanFailure(event, new RuntimeException("Trivy found vulnerabilities in ${image}"))
                 } else if (status != 0) {
                     // Any other non-zero code is an operational error (cache DB
-                    // lock, image pull failure, ...), not a vulnerability verdict.
-                    // Fail the build outright: allowFailure only tolerates
-                    // findings, and masking a transient error as a benign
-                    // UNSTABLE would make it indistinguishable from a clean scan.
-                    // No marker is written, so a retry re-scans from scratch.
-                    throw new RuntimeException("Trivy scan of ${image} failed with a non-vulnerability error (exit code ${status})")
+                    // lock, image pull failure, DB mirror down, ...), not a
+                    // vulnerability verdict. DELIBERATE PRODUCT DECISION: never
+                    // block the build on it — a developer's build must not be
+                    // held hostage to trivy infrastructure flakiness. But do not
+                    // let it pass silently either: mark the stage UNSTABLE with a
+                    // distinct message (so it is never indistinguishable from a
+                    // clean scan) and write NO marker (so a retry re-scans and
+                    // duplicates never inherit a transient error). This is
+                    // independent of allowFailure, which governs findings only.
+                    operationalError = true
+                    event.script.catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                        throw new RuntimeException("Trivy scan of ${image} failed with a non-vulnerability error (exit code ${status}); not blocking the build, retry once the scan infrastructure recovers")
+                    }
                 }
-                // Written only when execution continues past the verdict: on a
-                // findings failure without allowFailure the build aborts above,
-                // so duplicates never get to consult a marker anyway.
-                if (marker != '') {
+                // No marker on an operational error: it produced no verdict, so a
+                // retry must re-scan rather than reuse a broken run.
+                if (marker != '' && !operationalError) {
                     event.script.writeFile(file: marker, text: "${reportDir}|${scanFailed ? 'failed' : 'ok'}")
                 }
             }
@@ -150,10 +157,11 @@ class TrivyPlugin extends Plugin {
         """)
     }
 
-    // Only reached for a vulnerability-findings verdict (trivy exit 2):
-    // allowFailure keeps the build green with an UNSTABLE stage. Operational
-    // errors (exit 1) never reach here — doRunImageScan fails the build on them
-    // so a transient error can't masquerade as a clean/permissive pass.
+    // Reached for a vulnerability-findings verdict (trivy exit 2): allowFailure
+    // decides whether findings keep the build green with an UNSTABLE stage or
+    // fail it. Operational errors (any other non-zero exit) do NOT come here —
+    // doRunImageScan always downgrades those to UNSTABLE without blocking, since
+    // allowFailure is about tolerating findings, not infrastructure flakiness.
     private void handleScanFailure(Event event, Exception e) {
         if (this.allowFailure) {
             event.script.catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {

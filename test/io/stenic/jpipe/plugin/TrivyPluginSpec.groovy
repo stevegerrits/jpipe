@@ -321,7 +321,7 @@ class TrivyPluginSpec extends Specification {
             assert trivyRuns(script)[0].contains('--exit-code=2')
     }
 
-    def "[TrivyPlugin] an operational scan error fails the build even with allowFailure"() {
+    def "[TrivyPlugin] an operational scan error goes UNSTABLE and never blocks the build"() {
         given:
             def script = new FakeScript()
             script.scanExitCode = 1  // operational error (e.g. cache DB lock), not a vuln finding
@@ -331,12 +331,33 @@ class TrivyPluginSpec extends Specification {
             plugin.doRunImageScan(newEvent(script))
 
         then:
-            // allowFailure only tolerates vulnerability findings, never a broken
-            // scan: the error propagates and is not swallowed as UNSTABLE.
-            thrown(RuntimeException)
-            assert script.catchErrors.isEmpty()
+            // Product decision: a broken scan must never block a developer's
+            // build. It is downgraded to UNSTABLE (visible, not silent) rather
+            // than failing.
+            noExceptionThrown()
+            assert script.catchErrors.size() == 1
+            assert script.catchErrors[0].stageResult == 'UNSTABLE'
             // No marker is written, so a retry re-scans instead of reusing a
             // transient failure verdict.
             assert !script.files.keySet().any { it.startsWith('.trivy-scanned-') }
+            // The report is still published for the operator to inspect.
+            assert script.published.size() == 1
+    }
+
+    def "[TrivyPlugin] an operational scan error is non-blocking even without allowFailure"() {
+        given:
+            def script = new FakeScript()
+            script.scanExitCode = 1  // operational error, not a vuln finding
+            def plugin = new TrivyPlugin([containerImage: 'repo/app', allowFailure: false])
+
+        when:
+            plugin.doRunImageScan(newEvent(script))
+
+        then:
+            // allowFailure governs findings only; operational errors are always
+            // non-blocking, independent of it.
+            noExceptionThrown()
+            assert script.catchErrors.size() == 1
+            assert script.catchErrors[0].stageResult == 'UNSTABLE'
     }
 }
