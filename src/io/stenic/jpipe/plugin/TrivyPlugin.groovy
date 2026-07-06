@@ -26,11 +26,17 @@ class TrivyPlugin extends Plugin {
         this.eventWeight = opts.get('eventWeight', 20);
         // Named docker volume holding the Trivy cache (vulnerability DB). The DB
         // is re-downloaded on every scan otherwise, which typically costs more
-        // time than the scan itself. Set to '' to disable the mount.
-        this.cacheVolume = opts.get('cacheVolume', 'jpipe-trivy-cache');
+        // time than the scan itself. Defaults to a per-job volume (null =>
+        // "jpipe-trivy-cache-<job>"): trivy's cache DB takes an exclusive file
+        // lock, so one cluster-wide volume would let concurrent builds of
+        // unrelated jobs contend ("database is locked"). Scans within one build
+        // run sequentially and are safe. Set to '' to disable the mount, or to
+        // a fixed name to deliberately share a volume.
+        this.cacheVolume = opts.get('cacheVolume', null);
         // Pipelines that publish the same built image under several names would
         // scan identical bits once per name. When enabled, images whose docker
-        // image ID was already scanned in this build reuse the first report.
+        // image ID was already scanned in this build WITH THE SAME scan
+        // configuration reuse the first scan's report and verdict.
         this.skipDuplicates = opts.get('skipDuplicates', true);
     }
 
@@ -54,20 +60,34 @@ class TrivyPlugin extends Plugin {
 
         event.script.dir(event.script.pwd(tmp: true)) {
             String marker = this.duplicateMarker(event, image)
-            String priorReportDir = ''
+            String markerText = ''
             if (marker != '' && event.script.fileExists(marker)) {
-                priorReportDir = event.script.readFile(marker).trim()
+                markerText = event.script.readFile(marker).trim()
             }
 
-            if (priorReportDir != '') {
-                event.script.println("Skipping Trivy scan for ${image}: an identical image (same image ID) was already scanned in this build")
+            if (markerText != '') {
+                String priorReportDir = markerText.split(/\|/)[0]
+                Boolean priorFailed = markerText.endsWith('|failed')
+                event.script.println("Skipping Trivy scan for ${image}: an identical image (same image ID) was already scanned with the same configuration in this build")
                 if (this.report == 'html' || this.report == 'json') {
-                    event.script.sh "mkdir -p ${reportDir} && if [ -d '${priorReportDir}' ]; then cp -r '${priorReportDir}/.' '${reportDir}/'; fi"
+                    event.script.sh "mkdir -p '${reportDir}' && if [ -d '${priorReportDir}' ]; then cp -r '${priorReportDir}/.' '${reportDir}/'; fi"
+                }
+                if (priorFailed) {
+                    // Keep the verdict truthful on the skip path: the same
+                    // image failed its scan earlier in this build, so this
+                    // instance must fail (or go UNSTABLE) the same way.
+                    this.handleScanFailure(event, new Exception("Trivy reported issues for an identical image scanned earlier in this build (${image})"))
                 }
             } else {
-                this.runScan(event, image, reportDir)
+                Boolean scanFailed = false
+                try {
+                    this.execScan(event, image, reportDir)
+                } catch (Exception e) {
+                    scanFailed = true
+                    this.handleScanFailure(event, e)
+                }
                 if (marker != '') {
-                    event.script.writeFile(file: marker, text: reportDir)
+                    event.script.writeFile(file: marker, text: "${reportDir}|${scanFailed ? 'failed' : 'ok'}")
                 }
             }
 
@@ -75,7 +95,7 @@ class TrivyPlugin extends Plugin {
         }
     }
 
-    private void runScan(Event event, String image, String reportDir) {
+    private void execScan(Event event, String image, String reportDir) {
         List args = [
             '--no-progress',
             '--exit-code=1',
@@ -91,33 +111,46 @@ class TrivyPlugin extends Plugin {
         }
         args.add(this.extraFlags)
 
-        String cacheMount = this.cacheVolume != '' ? "-v ${this.cacheVolume}:/root/.cache/trivy" : ''
+        String volume = this.resolveCacheVolume(event)
+        String cacheMount = volume != '' ? "-v ${volume}:/root/.cache/trivy" : ''
 
-        try {
-            event.script.sh """
-                docker run \
-                    -v /var/run/docker.sock:/var/run/docker.sock \
-                    -v \$(pwd)/${reportDir}:/report \
-                    ${cacheMount} \
-                    ghcr.io/aquasecurity/trivy:${this.trivyVersion} \
-                    image ${args.join(' ')} ${image}
-            """
-        } catch (Exception e) {
-            if (this.allowFailure) {
-                event.script.catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-                    throw e
-                }
-            } else {
+        event.script.sh """
+            docker run \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -v \$(pwd)/${reportDir}:/report \
+                ${cacheMount} \
+                ghcr.io/aquasecurity/trivy:${this.trivyVersion} \
+                image ${args.join(' ')} ${image}
+        """
+    }
+
+    // Note: a non-zero exit can mean "vulnerabilities found" but also any other
+    // scan error (e.g. cache contention); trivy's exit code does not
+    // distinguish them, so neither can allowFailure.
+    private void handleScanFailure(Event event, Exception e) {
+        if (this.allowFailure) {
+            event.script.catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
                 throw e
             }
+        } else {
+            throw e
         }
     }
 
-    // A per-build, per-image-ID marker file in the shared tmp workspace. Two
-    // plugin instances that resolve to the same image ID (identical layers
-    // published under different names) produce the same marker, so the second
-    // one can tell a scan already happened. Returns '' when duplicate
-    // detection is disabled or the image ID cannot be resolved.
+    private String resolveCacheVolume(Event event) {
+        if (this.cacheVolume == null) {
+            String job = (event.script.env.JOB_BASE_NAME ?: 'default').toString().replaceAll(/[^A-Za-z0-9._-]/, '_')
+            return "jpipe-trivy-cache-${job}"
+        }
+        return this.cacheVolume
+    }
+
+    // A per-build marker file in the shared tmp workspace, keyed by image ID
+    // AND the scan-relevant configuration. Two plugin instances only share a
+    // marker when they would run the exact same scan on the exact same bits —
+    // a stricter or differently-formatted second instance still scans.
+    // Returns '' when duplicate detection is disabled or the image ID cannot
+    // be resolved.
     private String duplicateMarker(Event event, String image) {
         if (!this.skipDuplicates) {
             return ''
@@ -129,10 +162,13 @@ class TrivyPlugin extends Plugin {
             event.script.println("TrivyPlugin: could not resolve the image ID of ${image}; scanning without duplicate detection")
             return ''
         }
-        // Markers from previous builds are stale; clean them up as we go.
+        // Pure hygiene, not correctness: markers embed the unique BUILD_TAG so
+        // stale ones can never match a later build — this only stops them from
+        // accumulating in the tmp workspace.
         event.script.sh "find . -maxdepth 1 -name '.trivy-scanned-*' -mtime +1 -delete || true"
         String buildTag = event.script.env.BUILD_TAG ?: 'build'
-        String marker = ".trivy-scanned-${buildTag}-${event.version}-${imageId}"
+        String config = "${this.severity.join(',')}|${this.ignoreUnfixed}|${this.extraFlags}|${this.report}|${this.trivyVersion}"
+        String marker = ".trivy-scanned-${buildTag}-${event.version}-${imageId}-${config.hashCode()}"
         return marker.replaceAll(/[^A-Za-z0-9._-]/, '_')
     }
 

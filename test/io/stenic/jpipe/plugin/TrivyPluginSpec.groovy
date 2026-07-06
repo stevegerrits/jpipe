@@ -12,7 +12,8 @@ class TrivyPluginSpec extends Specification {
         Map files = [:]
         List published = []
         List printed = []
-        Map env = [BUILD_TAG: 'jenkins-job-42']
+        List catchErrors = []
+        Map env = [BUILD_TAG: 'jenkins-job-42', JOB_BASE_NAME: 'myjob']
         String imageId = 'sha256:abc123'
         boolean inspectFails = false
         boolean scanFails = false
@@ -42,6 +43,8 @@ class TrivyPluginSpec extends Specification {
         def println(def s) { printed << s.toString() }
         def publishHTML(Map target) { published << target.target }
         def catchError(Map opts, Closure c) {
+            // Like Jenkins: mark and continue.
+            catchErrors << opts
             try { c() } catch (Exception ignored) { }
         }
         def trivy(Map opts) { return opts }
@@ -72,7 +75,7 @@ class TrivyPluginSpec extends Specification {
             assert script.printed.any { it.contains('no containerImage') }
     }
 
-    def "[TrivyPlugin] mounts the cache volume so the vulnerability DB persists between scans"() {
+    def "[TrivyPlugin] mounts a per-job cache volume so the vulnerability DB persists between builds"() {
         given:
             def script = new FakeScript()
             def plugin = new TrivyPlugin([containerImage: 'repo/app', report: 'html'])
@@ -83,7 +86,19 @@ class TrivyPluginSpec extends Specification {
         then:
             def runs = trivyRuns(script)
             assert runs.size() == 1
-            assert runs[0].contains('-v jpipe-trivy-cache:/root/.cache/trivy')
+            assert runs[0].contains('-v jpipe-trivy-cache-myjob:/root/.cache/trivy')
+    }
+
+    def "[TrivyPlugin] an explicit cacheVolume name is used as-is"() {
+        given:
+            def script = new FakeScript()
+            def plugin = new TrivyPlugin([containerImage: 'repo/app', cacheVolume: 'shared-cache'])
+
+        when:
+            plugin.doRunImageScan(newEvent(script))
+
+        then:
+            assert trivyRuns(script)[0].contains('-v shared-cache:/root/.cache/trivy')
     }
 
     def "[TrivyPlugin] cacheVolume '' disables the cache mount"() {
@@ -100,7 +115,7 @@ class TrivyPluginSpec extends Specification {
             assert !runs[0].contains(':/root/.cache/trivy')
     }
 
-    def "[TrivyPlugin] scans an image once and records a marker for the build"() {
+    def "[TrivyPlugin] scans an image once and records a marker with the scan outcome"() {
         given:
             def script = new FakeScript()
             def plugin = new TrivyPlugin([containerImage: 'repo/app', report: 'html'])
@@ -110,7 +125,9 @@ class TrivyPluginSpec extends Specification {
 
         then:
             assert trivyRuns(script).size() == 1
-            assert script.files.keySet().any { it.startsWith('.trivy-scanned-') }
+            def markers = script.files.findAll { k, v -> k.startsWith('.trivy-scanned-') }
+            assert markers.size() == 1
+            assert markers.values()[0] == '.trivy-report-app|ok'
             assert script.published.size() == 1
             assert script.published[0].reportName == 'Trivy - app'
     }
@@ -131,6 +148,35 @@ class TrivyPluginSpec extends Specification {
             assert script.shCommands.any { it.contains("cp -r '.trivy-report-app/.' '.trivy-report-app-mirror/'") }
             assert script.published.size() == 2
             assert script.published[1].reportName == 'Trivy - app-mirror'
+    }
+
+    def "[TrivyPlugin] scans again when the second instance has a different scan configuration"() {
+        given:
+            def script = new FakeScript()
+            def relaxed = new TrivyPlugin([containerImage: 'repo/app', severity: ['LOW']])
+            def strictGate = new TrivyPlugin([containerImage: 'repo/app-mirror', severity: ['CRITICAL']])
+
+        when:
+            relaxed.doRunImageScan(newEvent(script))
+            strictGate.doRunImageScan(newEvent(script))
+
+        then:
+            assert trivyRuns(script).size() == 2
+    }
+
+    def "[TrivyPlugin] scans again when the report format differs"() {
+        given:
+            def script = new FakeScript()
+            def table = new TrivyPlugin([containerImage: 'repo/app', report: 'table'])
+            def html = new TrivyPlugin([containerImage: 'repo/app-mirror', report: 'html'])
+
+        when:
+            table.doRunImageScan(newEvent(script))
+            html.doRunImageScan(newEvent(script))
+
+        then:
+            assert trivyRuns(script).size() == 2
+            assert script.published.size() == 1
     }
 
     def "[TrivyPlugin] scans both images when their image IDs differ"() {
@@ -178,7 +224,7 @@ class TrivyPluginSpec extends Specification {
             assert script.printed.any { it.contains('could not resolve') }
     }
 
-    def "[TrivyPlugin] allowFailure swallows a failing scan and still publishes"() {
+    def "[TrivyPlugin] allowFailure swallows a failing scan, publishes, and records the failed verdict"() {
         given:
             def script = new FakeScript()
             script.scanFails = true
@@ -189,7 +235,10 @@ class TrivyPluginSpec extends Specification {
 
         then:
             noExceptionThrown()
+            assert script.catchErrors.size() == 1
             assert script.published.size() == 1
+            def markers = script.files.findAll { k, v -> k.startsWith('.trivy-scanned-') }
+            assert markers.values()[0] == '.trivy-report-app|failed'
     }
 
     def "[TrivyPlugin] a failing scan without allowFailure propagates"() {
@@ -203,5 +252,39 @@ class TrivyPluginSpec extends Specification {
 
         then:
             thrown(RuntimeException)
+    }
+
+    def "[TrivyPlugin] a skipped duplicate of a failed scan re-signals the failure"() {
+        given:
+            def script = new FakeScript()
+            script.scanFails = true
+            def first = new TrivyPlugin([containerImage: 'repo/app', report: 'html', allowFailure: true])
+            def mirror = new TrivyPlugin([containerImage: 'repo/app-mirror', report: 'html', allowFailure: true])
+
+        when:
+            first.doRunImageScan(newEvent(script))
+            mirror.doRunImageScan(newEvent(script))
+
+        then:
+            noExceptionThrown()
+            assert trivyRuns(script).size() == 1
+            assert script.catchErrors.size() == 2
+            assert script.published.size() == 2
+    }
+
+    def "[TrivyPlugin] a strict duplicate of a failed scan fails hard without allowFailure"() {
+        given:
+            def script = new FakeScript()
+            script.scanFails = true
+            def first = new TrivyPlugin([containerImage: 'repo/app', report: 'html', allowFailure: true])
+            def strictGate = new TrivyPlugin([containerImage: 'repo/app-mirror', report: 'html', allowFailure: false])
+
+        when:
+            first.doRunImageScan(newEvent(script))
+            strictGate.doRunImageScan(newEvent(script))
+
+        then:
+            thrown(Exception)
+            assert trivyRuns(script).size() == 1
     }
 }
