@@ -184,7 +184,7 @@ class TrivyPlugin extends Plugin {
         }
         String imageId = ''
         try {
-            imageId = event.script.sh(script: "docker inspect -f '{{.Id}}' ${image}", returnStdout: true).trim()
+            imageId = event.script.sh(script: "docker inspect -f '{{.Id}}' '${image}'", returnStdout: true).trim()
         } catch (Exception e) {
             event.script.println("TrivyPlugin: could not resolve the image ID of ${image}; scanning without duplicate detection")
             return ''
